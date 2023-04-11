@@ -11,7 +11,7 @@ const TAG_URL: &str = "http://translatedby.com/you/tags/GURPS/";
 fn get_pages_urls(url: &str) -> Result<Vec<String>, Box<dyn Error>> {
     let mut pages_urls: Vec<String> = vec![url.to_owned()];
 
-    let text = reqwest::blocking::get(url).expect("Server error").text()?;
+    let text = reqwest::blocking::get(url)?.text()?;
     let document = Html::parse_document(&text);
     let selector = Selector::parse(r#"div.spager a"#)?;
 
