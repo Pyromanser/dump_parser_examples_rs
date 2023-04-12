@@ -1,17 +1,21 @@
 use chrono;
+use futures::{stream, StreamExt};
+use reqwest::Client;
 use scraper::{Html, Selector};
 use std::error::Error;
 use std::fs::{self, DirBuilder};
 use std::time::SystemTime;
+use tokio;
 
 const SITE_BASE_URL: &str = "http://translatedby.com";
 const TAG: &str = "GURPS";
 const TAG_URL: &str = "http://translatedby.com/you/tags/GURPS/";
+const CONCURRENT_REQUESTS: usize = 2;
 
-fn get_pages_urls(url: &str) -> Result<Vec<String>, Box<dyn Error>> {
+async fn get_pages_urls(url: &str, client: &Client) -> Result<Vec<String>, Box<dyn Error>> {
     let mut pages_urls: Vec<String> = vec![url.to_owned()];
 
-    let text = reqwest::blocking::get(url)?.text()?;
+    let text = client.get(url).send().await?.text().await?;
     let document = Html::parse_document(&text);
     let selector = Selector::parse(r#"div.spager a"#)?;
 
@@ -28,7 +32,8 @@ fn get_pages_urls(url: &str) -> Result<Vec<String>, Box<dyn Error>> {
     Ok(pages_urls)
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "Starting dumping {} at {}",
         TAG,
@@ -40,11 +45,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     let dump_dir_name: String = format!("{}_{}_rust", TAG, timestamp);
     DirBuilder::new().create(&dump_dir_name)?;
 
-    let pages_urls = get_pages_urls(TAG_URL)?;
-    pages_urls
-        .iter()
-        .map(|url| parse_page(url, &dump_dir_name))
-        .for_each(drop);
+    let client = Client::new();
+
+    let pages_urls = get_pages_urls(TAG_URL, &client).await?;
+
+    let requests = stream::iter(pages_urls)
+        .map(|url| {
+            let client = &client;
+            let dump_dir_name = &dump_dir_name;
+            async move { parse_page(&url, &dump_dir_name, &client).await }
+        })
+        .buffer_unordered(CONCURRENT_REQUESTS);
+
+    requests
+        .for_each(|b| async {
+            match b {
+                Ok(_) => println!("Ok",),
+                Err(e) => eprintln!("Got an error: {}", e),
+            }
+        })
+        .await;
 
     println!("Duration: {:?}", SystemTime::now().duration_since(start)?);
     println!(
@@ -55,10 +75,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn parse_page(url: &str, dump_dir_name: &str) -> Result<(), Box<dyn Error>> {
+async fn parse_page(url: &str, dump_dir_name: &str, client: &Client) -> Result<(), Box<dyn Error>> {
     println!("Page: {}", url);
 
-    let text = reqwest::blocking::get(url)?.text()?;
+    let text = client.get(url).send().await?.text().await?;
 
     let document = Html::parse_document(&text);
     let selector = Selector::parse(r#"dl.translations-list dt a"#)?;
@@ -78,15 +98,28 @@ fn parse_page(url: &str, dump_dir_name: &str) -> Result<(), Box<dyn Error>> {
     println!("{:#?}", book_names);
     println!("{:#?}", book_urls);
 
-    book_names
-        .iter()
-        .zip(book_urls.iter())
-        .map(|(name, url)| parse_book(name, url, &dump_dir_name))
-        .for_each(drop);
+    let requests = stream::iter(book_names.iter().zip(book_urls.iter()))
+        .map(|(name, url)| async move { parse_book(name, url, &dump_dir_name, &client).await })
+        .buffer_unordered(CONCURRENT_REQUESTS);
+
+    requests
+        .for_each(|b| async {
+            match b {
+                Ok(_) => println!("Ok",),
+                Err(e) => eprintln!("Got an error: {}", e),
+            }
+        })
+        .await;
+
     Ok(())
 }
 
-fn parse_book(name: &str, url: &str, dump_dir_name: &str) -> Result<(), Box<dyn Error>> {
+async fn parse_book(
+    name: &str,
+    url: &str,
+    dump_dir_name: &str,
+    client: &Client,
+) -> Result<(), Box<dyn Error>> {
     println!("Book: {}", name);
     println!("Book url: {}", url);
 
@@ -96,7 +129,7 @@ fn parse_book(name: &str, url: &str, dump_dir_name: &str) -> Result<(), Box<dyn 
     let book_dir_name = format!("{}/{}", dump_dir_name, name);
     DirBuilder::new().create(&book_dir_name)?;
 
-    let text = reqwest::blocking::get(&about_page_url)?.text()?;
+    let text = client.get(&about_page_url).send().await?.text().await?;
 
     let document = Html::parse_document(&text);
     let selector = Selector::parse(r#"#about-translation blockquote"#)?;
@@ -110,7 +143,7 @@ fn parse_book(name: &str, url: &str, dump_dir_name: &str) -> Result<(), Box<dyn 
         format!("URL - {}\n{}", url, blockquote).as_bytes(),
     )?;
 
-    let text = reqwest::blocking::get(&book_file_url)?.text()?;
+    let text = client.get(&book_file_url).send().await?.text().await?;
 
     fs::write(format!("{}/book.txt", &book_dir_name), text.as_bytes())?;
     Ok(())
